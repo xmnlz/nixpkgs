@@ -3,9 +3,11 @@
   stdenv,
   stdenvNoCC,
   fetchFromGitHub,
-  buildNpmPackage,
+  makeWrapper,
   coreutils,
   nodejs_22,
+  node-gyp,
+  python311,
   bun,
   pkg-config,
   anytype-heart,
@@ -59,25 +61,16 @@ stdenvNoCC.mkDerivation (finalAttrs: {
 
       export BUN_INSTALL_CACHE_DIR=$(mktemp -d)
       bun install \
+        # https://bun.com/docs/pm/cli/install#configuring-with-environment-variables
+
+        # From docs:
+        # Bun always tries to use the fastest available installation method for the target platform. On macOS, that’s clonefile and on Linux, that’s hardlink.
+        --backend=copyfile \
         --cpu="*" \
         --frozen-lockfile \
         --ignore-scripts \
         --no-progress \
         --os="*"
-      # bun install \
-      #   --cpu="*" \
-      #   --frozen-lockfile \
-      #   --filter ./ \
-      #   --filter ./packages/app \
-      #   --filter ./packages/desktop \
-      #   --filter ./packages/opencode \
-      #   --filter ./packages/shared \
-      #   --ignore-scripts \
-      #   --no-progress \
-      #   --os="*"
-
-      # bun --bun ./nix/scripts/canonicalize-node-modules.ts
-      # bun --bun ./nix/scripts/normalize-bun-binaries.ts
 
       runHook postBuild
     '';
@@ -91,15 +84,12 @@ stdenvNoCC.mkDerivation (finalAttrs: {
       runHook postInstall
     '';
 
-    # NOTE: Required else we get errors that our fixed-output derivation references store paths
     dontFixup = true;
 
     outputHash = "sha256-walRZOP+BKgfDwVTi8rDMQFWXLiDR3zlPpYAI9BJO78=";
     outputHashAlgo = "sha256";
     outputHashMode = "recursive";
   };
-
-  # npm dependency install fails with nodejs_24: https://github.com/NixOS/nixpkgs/issues/474535
 
   env = {
     ELECTRON_SKIP_BINARY_DOWNLOAD = "1";
@@ -112,12 +102,14 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     go
     protobuf
     copyDesktopItems
+    makeWrapper
+    node-gyp
+    stdenv.cc
+    python311
   ];
-  buildInputs = [ libsecret ];
 
-  npmFlags = [
-    # keytar needs to be built against electron's ABI
-    "--nodedir=${electron.headers}"
+  buildInputs = [
+    libsecret
   ];
 
   patches = [
@@ -138,27 +130,42 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   buildPhase = ''
     runHook preBuild
 
+    # Building keytar against electron's ABI
+    # Trying to build in temp dir, will not work duo to the keytar calling the node -p require('node-addon-api').include_dir
+    # but building inside the node_modules/keytar will find the ../node-addon-api automaticly
+    chmod -R u+w node_modules/keytar node_modules/node-addon-api
+    pushd node_modules/keytar
+    HOME=$(mktemp -d) node-gyp rebuild --nodedir=${electron.headers}
+    popd
+
+    sed -i "s%/usr/bin/env%${coreutils}/bin/env%" scripts/generate-protos.sh
+
     cp -r ${anytype-heart}/lib dist/
     cp -r ${anytype-heart}/bin/anytypeHelper dist/
+
+    # Without this, build fails when trying to copy/write into that directory during the js bundle step
+    chmod -R u+w dist/
+
+    bash ./scripts/generate-protos.sh --from-dist
+
+    bun run build
 
     for lang in ${finalAttrs.locales}/locales/*; do
       cp "$lang" "dist/lib/json/lang/$(basename $lang)"
     done
 
-    sed -i "s%/usr/bin/env%${coreutils}/bin/env%" scripts/generate-protos.sh
-
-    bash ./scripts/generate-protos.sh --from-dist
-
-    bun run build
-    # bun run build:nmh
+    # $HOME/.cache/go-build.
+    export GOCACHE=$(mktemp -d)
+    # go build -o dist/nativeMessagingHost ./go/nativeMessagingHost.go
+    bun run build:nmh
 
     runHook postBuild
   '';
 
-  # remove unnecessary files
+   # remove unnecessary files
   preInstall = ''
-    npm prune --omit=dev
-    chmod u+w -R dist
+    # npm prune --omit=dev
+    chmod u+w -R dist node_modules
     find -type f \( -name "*.ts" -o -name "*.map" \) -exec rm -rf {} +
   '';
 
@@ -181,8 +188,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
       --add-flags $out/lib/anytype/ \
       --add-flags ${lib.escapeShellArg commandLineArgs}
 
-    # wrapProgram $out/lib/anytype/dist/nativeMessagingHost \
-    #    --prefix PATH : ${lib.makeBinPath [ lsof ]}
+    wrapProgram $out/lib/anytype/dist/nativeMessagingHost \
+      --prefix PATH : ${lib.makeBinPath [ lsof ]}
 
     runHook postInstall
   '';
